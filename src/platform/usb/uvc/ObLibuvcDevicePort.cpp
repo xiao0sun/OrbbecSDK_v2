@@ -11,10 +11,12 @@
 #include "stream/StreamProfileFactory.hpp"
 #include "stream/StreamProfile.hpp"
 #include "usb/enumerator/UsbEnumeratorLibusb.hpp"
+#include "common/CommonFields.hpp"
 
 #include <utlist.h>
 #include <libuvc/libuvc_internal.h>
 #include <algorithm>
+#include <cstdlib>
 
 #define UVC_AE_MODE_D0_MANUAL (1 << 0)
 #define UVC_AE_MODE_D1_AUTO (1 << 1)
@@ -28,6 +30,32 @@
 
 namespace libobsensor {
 using utils::fourCc2Int;
+
+namespace {
+constexpr uint16_t FEMTO_BOLT_PID = 0x066B;
+
+bool isFemtoBolt(const std::shared_ptr<const USBSourcePortInfo> &portInfo) {
+    return portInfo && portInfo->vid == ORBBEC_DEVICE_VID && portInfo->pid == FEMTO_BOLT_PID;
+}
+
+bool shouldSkipClearHalt(const std::shared_ptr<const USBSourcePortInfo> &portInfo) {
+    return isFemtoBolt(portInfo) && std::getenv("OB_BOLT_SKIP_CLEAR_HALT");
+}
+
+void logClearHaltResult(const char *scope, const std::shared_ptr<const USBSourcePortInfo> &portInfo, uint8_t endpointAddr, int ret) {
+    if(ret == LIBUSB_SUCCESS) {
+        return;
+    }
+#if defined(__APPLE__)
+    if(isFemtoBolt(portInfo) && ret == LIBUSB_ERROR_NOT_FOUND) {
+        LOG_DEBUG("libusb_clear_halt returned LIBUSB_ERROR_NOT_FOUND in {}, endpoint=0x{:02x}", scope, endpointAddr);
+        return;
+    }
+#endif
+    LOG_ERROR("libusb_clear_halt failed in {}, endpoint=0x{:02x}, error code={}", scope, endpointAddr, ret);
+}
+}  // namespace
+
 const std::map<uint32_t, uvc_frame_format> fourccToUvcFormatMap = {
     { fourCc2Int('U', 'Y', 'V', 'Y'), UVC_FRAME_FORMAT_UYVY }, { fourCc2Int('Y', 'U', 'Y', '2'), UVC_FRAME_FORMAT_YUYV },
     { fourCc2Int('N', 'V', '1', '2'), UVC_FRAME_FORMAT_NV12 }, { fourCc2Int('I', '4', '2', '0'), UVC_FRAME_FORMAT_I420 },
@@ -119,13 +147,18 @@ void ObLibuvcDevicePort::startStream(std::shared_ptr<const StreamProfile> profil
     auto              res = uvc_get_stream_ctrl_format_size(uvcDevHandle_, &ctrl, fourCC2UvcFormat(selectedUvcProfile.fourcc), videoProfile->getWidth(),
                                                             videoProfile->getHeight(), videoProfile->getFps());
     if(res < 0) {
-        LOG_ERROR("uvc_get_stream_ctrl_format_size failed!");
+        LOG_ERROR("uvc_get_stream_ctrl_format_size failed, ret={}, if={}, ep=0x{:02x}, fourcc=0x{:08x}, width={}, height={}, fps={}", static_cast<int>(res),
+                  selectedUvcProfile.interfaceNumber, selectedUvcProfile.endpointAddress, selectedUvcProfile.fourcc, videoProfile->getWidth(),
+                  videoProfile->getHeight(), videoProfile->getFps());
         THROW_IO_EXCEPTION("uvc_get_stream_ctrl_format_size failed!");
     }
 
     uvc_stream_handle_t *uvcStreamHandle = nullptr;
     uvc_error_t          ret             = uvc_stream_open_ctrl(uvcDevHandle_, &uvcStreamHandle, &ctrl);
     if(ret != UVC_SUCCESS) {
+        LOG_ERROR("uvc_stream_open_ctrl failed, ret={}, if={}, ep=0x{:02x}, fourcc=0x{:08x}, width={}, height={}, fps={}", static_cast<int>(ret),
+                  selectedUvcProfile.interfaceNumber, selectedUvcProfile.endpointAddress, selectedUvcProfile.fourcc, videoProfile->getWidth(),
+                  videoProfile->getHeight(), videoProfile->getFps());
         THROW_IO_EXCEPTION("uvc_stream_open_ctrl failed!");
     }
 
@@ -182,15 +215,16 @@ void ObLibuvcDevicePort::stopStream(std::shared_ptr<const StreamProfile> profile
 
     uvc_stream_handle_t *uvcStreamHandle = (*it)->streamHandle;
     auto                 endpointAddr    = uvcStreamHandle->stream_if->bEndpointAddress;
-#ifdef OS_MACOS
-    libusb_clear_halt(uvcDevHandle_->usb_devh, endpointAddr);
-#endif
     uvc_stream_stop(uvcStreamHandle);
     uvc_stream_close(uvcStreamHandle);
 
-#ifndef OS_MACOS
-    libusb_clear_halt(uvcDevHandle_->usb_devh, endpointAddr);
-#endif
+    if(shouldSkipClearHalt(portInfo_)) {
+        LOG_DEBUG("Skipping libusb_clear_halt in stopStream, endpoint=0x{:02x}", endpointAddr);
+    }
+    else {
+        auto clearRet = libusb_clear_halt(uvcDevHandle_->usb_devh, endpointAddr);
+        logClearHaltResult("stopStream", portInfo_, endpointAddr, clearRet);
+    }
 
     streamHandles_.erase(it);
     LOG_DEBUG("ObLibuvcDevicePort::stopStream() done");
@@ -206,10 +240,12 @@ void ObLibuvcDevicePort::stopAllStream() {
         auto                 endpointAddr    = uvcStreamHandle->stream_if->bEndpointAddress;
         uvc_stream_stop(uvcStreamHandle);
         uvc_stream_close(uvcStreamHandle);
-        auto ret = libusb_clear_halt(uvcDevHandle_->usb_devh, endpointAddr);
-        if(ret != LIBUSB_SUCCESS) {
-            LOG_ERROR("libusb_clear_halt failed, error code={}", ret);
+        if(shouldSkipClearHalt(portInfo_)) {
+            LOG_DEBUG("Skipping libusb_clear_halt in stopAllStream, endpoint=0x{:02x}", endpointAddr);
+            continue;
         }
+        auto ret = libusb_clear_halt(uvcDevHandle_->usb_devh, endpointAddr);
+        logClearHaltResult("stopAllStream", portInfo_, endpointAddr, ret);
     }
     streamHandles_.clear();
     LOG_DEBUG("ObLibuvcDevicePort::stopAllStream() done");
@@ -279,14 +315,18 @@ bool ObLibuvcDevicePort::setXu(uint8_t ctrl, const uint8_t *data, uint32_t len) 
     std::lock_guard<std::recursive_mutex> lock(ctrlMutex_);
     auto recv = uvc_set_ctrl(uvcDevHandle_, xuUnit_.unit, ctrl, const_cast<uint8_t *>(data), len);
     if(recv <= 0) {
-        LOG_ERROR("setXu failed, error code={}", recv);
+        LOG_ERROR("setXu failed, error code={}, unit={}, ctrl={}, len={}, vc_if={}", recv, xuUnit_.unit, ctrl, len,
+                  uvcDevHandle_->info->ctrl_if.bInterfaceNumber);
         return false;
     }
+    LOG_DEBUG("setXu success, transferred={}, unit={}, ctrl={}, len={}, vc_if={}", recv, xuUnit_.unit, ctrl, len,
+              uvcDevHandle_->info->ctrl_if.bInterfaceNumber);
     return true;
 }
 
 bool ObLibuvcDevicePort::getXu(uint8_t ctrl, uint8_t *data, uint32_t *len) {
     std::lock_guard<std::recursive_mutex> lock(ctrlMutex_);
+    const auto requestedLen = *len;
     switch((ObVendorXuCtrlId)ctrl) {
     case OB_VENDOR_XU_CTRL_ID_512:
         *len = 512;
@@ -308,14 +348,34 @@ bool ObLibuvcDevicePort::getXu(uint8_t ctrl, uint8_t *data, uint32_t *len) {
             THROW_IO_EXCEPTION_WITH_ERROR("getXu IO error: XU response channel returned LIBUSB_ERROR_IO (-1)",
                                           OB_ERROR_DEVICE_RESPONSE_CHANNEL_FAILURE);
         }
-        LOG_ERROR("getXu failed, error code={}", recv);
+        LOG_ERROR("getXu failed, error code={}, unit={}, ctrl={}, requestedLen={}, actualCtrlLen={}, vc_if={}", recv, xuUnit_.unit, ctrl, requestedLen,
+                  static_cast<uint32_t>(ctrl == OB_VENDOR_XU_CTRL_ID_64 ? 64 : (ctrl == OB_VENDOR_XU_CTRL_ID_512 ? 512 : 1024)),
+                  uvcDevHandle_->info->ctrl_if.bInterfaceNumber);
         return false;
     }
+    LOG_DEBUG("getXu success, transferred={}, unit={}, ctrl={}, requestedLen={}, vc_if={}", recv, xuUnit_.unit, ctrl, requestedLen,
+              uvcDevHandle_->info->ctrl_if.bInterfaceNumber);
     return true;
 }
 
 uint32_t ObLibuvcDevicePort::sendAndReceive(const uint8_t *sendData, uint32_t sendLen, uint8_t *recvData, uint32_t exceptedRecvLen) {
     std::lock_guard<std::recursive_mutex> lock(ctrlMutex_);
+    auto readU16 = [](const uint8_t *data, uint32_t len, uint32_t offset) -> uint16_t {
+        if(!data || offset + 2 > len) {
+            return 0;
+        }
+        return static_cast<uint16_t>(data[offset]) | static_cast<uint16_t>(data[offset + 1] << 8);
+    };
+    auto readU32 = [](const uint8_t *data, uint32_t len, uint32_t offset) -> uint32_t {
+        if(!data || offset + 4 > len) {
+            return 0;
+        }
+        return static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) | (static_cast<uint32_t>(data[offset + 2]) << 16)
+               | (static_cast<uint32_t>(data[offset + 3]) << 24);
+    };
+    const uint16_t opcode    = readU16(sendData, sendLen, 4);
+    const uint16_t requestId = readU16(sendData, sendLen, 6);
+    const uint32_t propertyId = readU32(sendData, sendLen, 8);
 
     uint8_t ctrl = OB_VENDOR_XU_CTRL_ID_64;
 
@@ -334,6 +394,8 @@ uint32_t ObLibuvcDevicePort::sendAndReceive(const uint8_t *sendData, uint32_t se
     }
 
     if(!setXu(ctrl, sendData, alignDataLen)) {
+        LOG_ERROR("sendAndReceive setXu failed, opcode={}, requestId={}, propertyId={}, sendLen={}, alignedLen={}, expectedRecvLen={}, ctrl={}", opcode, requestId,
+                  propertyId, sendLen, alignDataLen, exceptedRecvLen, ctrl);
         return 0;
     }
 
@@ -348,7 +410,10 @@ uint32_t ObLibuvcDevicePort::sendAndReceive(const uint8_t *sendData, uint32_t se
         ctrl = OB_VENDOR_XU_CTRL_ID_512;
     }
 
+    const auto requestedRecvLen = exceptedRecvLen;
     if(!getXu(ctrl, recvData, &exceptedRecvLen)) {
+        LOG_ERROR("sendAndReceive getXu failed, opcode={}, requestId={}, propertyId={}, sendLen={}, requestedRecvLen={}, returnedLen={}, ctrl={}", opcode,
+                  requestId, propertyId, sendLen, requestedRecvLen, exceptedRecvLen, ctrl);
         return 0;
     }
     return exceptedRecvLen;

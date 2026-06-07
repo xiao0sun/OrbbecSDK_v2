@@ -93,10 +93,6 @@ bool checkDevice(libusb_device *device) {
         return false;
     }
 
-    if(desc.idProduct == 0x066B && desc.idVendor == ORBBEC_DEVICE_VID) {
-        LOG_WARN("Femto Bolt is unavailable on macOS duo to Depth Engine");
-        return false;
-    }
     if(!isSupportedDevice(desc.idVendor, desc.idProduct)) {
         return false;
     }

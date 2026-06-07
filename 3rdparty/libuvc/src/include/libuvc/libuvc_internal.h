@@ -245,6 +245,7 @@ struct uvc_device_handle {
     struct uvc_device_handle *prev, *next;
     /** Underlying USB device handle */
     libusb_device_handle   *usb_devh;
+    uint8_t                 owns_usb_devh;
     struct uvc_device_info *info;
     struct libusb_transfer *status_xfer;
     uint8_t                 status_buf[32];
@@ -259,6 +260,7 @@ struct uvc_device_handle {
     /** Whether the camera is an iSight that sends one header per frame */
     uint8_t  is_isight;
     uint32_t claimed;
+    uint32_t detached;
 };
 
 /** Context within which we communicate with devices */

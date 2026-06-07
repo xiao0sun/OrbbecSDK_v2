@@ -15,11 +15,13 @@ add_custom_command(
     POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_LIST_DIR}/frameprocessor/${OB_CURRENT_OS}" "${OB_RESOURCES_OUTPUT_DIRECTORY}/extensions/frameprocessor")
 
-if(NOT APPLE)
+set(OB_DEPTHENGINE_EXTENSION_DIR "${CMAKE_CURRENT_LIST_DIR}/depthengine/${OB_CURRENT_OS}")
+
+if(EXISTS "${OB_DEPTHENGINE_EXTENSION_DIR}")
     add_custom_command(
         TARGET extensions
         POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_LIST_DIR}/depthengine/${OB_CURRENT_OS}" "${OB_RESOURCES_OUTPUT_DIRECTORY}/extensions/depthengine")
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${OB_DEPTHENGINE_EXTENSION_DIR}" "${OB_RESOURCES_OUTPUT_DIRECTORY}/extensions/depthengine")
 endif()
 
 add_custom_command(
@@ -35,8 +37,8 @@ if(OB_IS_MAIN_PROJECT)
 
     install(DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/frameprocessor/${OB_CURRENT_OS}/" DESTINATION "${OB_EXTENSIONS_INSTALL_RPEFIX}/extensions/frameprocessor")
 
-if(NOT APPLE)
-    install(DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/depthengine/${OB_CURRENT_OS}/" DESTINATION "${OB_EXTENSIONS_INSTALL_RPEFIX}/extensions/depthengine")
+if(EXISTS "${OB_DEPTHENGINE_EXTENSION_DIR}")
+    install(DIRECTORY "${OB_DEPTHENGINE_EXTENSION_DIR}/" DESTINATION "${OB_EXTENSIONS_INSTALL_RPEFIX}/extensions/depthengine")
 endif()
 
     install(DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/firmwareupdater/${OB_CURRENT_OS}/" DESTINATION "${OB_EXTENSIONS_INSTALL_RPEFIX}/extensions/firmwareupdater")

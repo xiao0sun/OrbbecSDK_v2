@@ -33,7 +33,8 @@ BoltPresetManager::BoltPresetManager(IDevice *owner) : DeviceComponentBase(owner
                 currentPreset_ = "Custom";
             }
         });
-    storeCurrentParamsAsCustomPreset("Custom");
+    availablePresets_.emplace_back("Custom");
+    customPresets_.emplace("Custom", BoltPreset{});
 }
 
 void BoltPresetManager::loadPreset(const std::string &presetName) {

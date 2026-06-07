@@ -38,6 +38,7 @@
 
 #include "libuvc/libuvc.h"
 #include "libuvc/libuvc_internal.h"
+#include <stdio.h>
 
 int  uvc_already_open(uvc_context_t *ctx, struct libusb_device *usb_dev);
 void uvc_free_devh(uvc_device_handle_t *devh);
@@ -240,19 +241,26 @@ uvc_error_t uvc_open(uvc_device_t *dev, uint16_t mi, uvc_device_handle_t **devh,
 
     UVC_ENTER();
 #ifndef __ANDROID__
-    ret = libusb_open(dev->usb_dev, &usb_devh);
-    UVC_DEBUG("libusb_open() = %d", ret);
+    uint8_t owns_usb_devh = 0;
+    if(!usb_devh) {
+        ret = libusb_open(dev->usb_dev, &usb_devh);
+        owns_usb_devh = 1;
+        UVC_DEBUG("libusb_open() = %d", ret);
 
-    if(ret != UVC_SUCCESS) {
-        UVC_EXIT(ret);
-        return ret;
+        if(ret != UVC_SUCCESS) {
+            UVC_EXIT(ret);
+            return ret;
+        }
     }
 #endif
     uvc_ref_device(dev);
 
-    internal_devh           = calloc(1, sizeof(*internal_devh));
-    internal_devh->dev      = dev;
-    internal_devh->usb_devh = usb_devh;
+    internal_devh                = calloc(1, sizeof(*internal_devh));
+    internal_devh->dev           = dev;
+    internal_devh->usb_devh      = usb_devh;
+#ifndef __ANDROID__
+    internal_devh->owns_usb_devh = owns_usb_devh;
+#endif
 
     ret = uvc_get_device_info(dev, mi, &(internal_devh->info));
 
@@ -305,7 +313,11 @@ fail:
     if(internal_devh->info) {
         uvc_release_if(internal_devh, internal_devh->info->ctrl_if.bInterfaceNumber);
     }
-    libusb_close(usb_devh);
+#ifndef __ANDROID__
+    if(internal_devh->owns_usb_devh) {
+        libusb_close(usb_devh);
+    }
+#endif
     uvc_unref_device(dev);
     uvc_free_devh(internal_devh);
 
@@ -821,10 +833,14 @@ uvc_error_t uvc_claim_if(uvc_device_handle_t *devh, int idx) {
     /* Tell libusb to detach any active kernel drivers. libusb will keep track of whether
      * it found a kernel driver for this interface. */
     ret = libusb_detach_kernel_driver(devh->usb_devh, idx);
+    if(ret == UVC_SUCCESS) {
+        devh->detached |= (1 << idx);
+    }
 
-    if(ret == UVC_SUCCESS || ret == LIBUSB_ERROR_NOT_FOUND || ret == LIBUSB_ERROR_NOT_SUPPORTED) {
+    if(ret == UVC_SUCCESS || ret == LIBUSB_ERROR_NOT_FOUND || ret == LIBUSB_ERROR_NOT_SUPPORTED || ret == LIBUSB_ERROR_ACCESS) {
         UVC_DEBUG("claiming interface %d", idx);
-        if(!(ret = libusb_claim_interface(devh->usb_devh, idx))) {
+        ret = libusb_claim_interface(devh->usb_devh, idx);
+        if(!ret) {
             devh->claimed |= (1 << idx);
         }
     }
@@ -866,17 +882,21 @@ uvc_error_t uvc_release_if(uvc_device_handle_t *devh, int idx) {
         devh->claimed &= ~(1 << idx);
         /* Reattach any kernel drivers that were disabled when we claimed this interface */
 
-        // bug fix: JDRN-1824, 解决贾维斯再linux、android 平台重连设备后depth、ir开流失败问题
-        ret = libusb_attach_kernel_driver(devh->usb_devh, idx);
+        if(devh->detached & (1 << idx)) {
+            // bug fix: JDRN-1824, 解决贾维斯再linux、android 平台重连设备后depth、ir开流失败问题
+            ret = libusb_attach_kernel_driver(devh->usb_devh, idx);
 
-        if(ret == UVC_SUCCESS) {
-            UVC_DEBUG("reattached kernel driver to interface %d", idx);
-        }
-        else if(ret == LIBUSB_ERROR_NOT_FOUND || ret == LIBUSB_ERROR_NOT_SUPPORTED) {
-            ret = UVC_SUCCESS; /* NOT_FOUND and NOT_SUPPORTED are OK: nothing to do */
-        }
-        else {
-            UVC_DEBUG("error reattaching kernel driver to interface %d: %s", idx, uvc_strerror(ret));
+            if(ret == UVC_SUCCESS) {
+                devh->detached &= ~(1 << idx);
+                UVC_DEBUG("reattached kernel driver to interface %d", idx);
+            }
+            else if(ret == LIBUSB_ERROR_NOT_FOUND || ret == LIBUSB_ERROR_NOT_SUPPORTED) {
+                devh->detached &= ~(1 << idx);
+                ret = UVC_SUCCESS; /* NOT_FOUND and NOT_SUPPORTED are OK: nothing to do */
+            }
+            else {
+                UVC_DEBUG("error reattaching kernel driver to interface %d: %s", idx, uvc_strerror(ret));
+            }
         }
     }
 
@@ -1574,13 +1594,17 @@ void uvc_close(uvc_device_handle_t *devh) {
     if(ctx->own_usb_ctx && ctx->open_devices == devh && devh->next == NULL) {
         ctx->kill_handler_thread = 1;
 #ifndef __ANDROID__
-        libusb_close(devh->usb_devh);
+        if(devh->owns_usb_devh) {
+            libusb_close(devh->usb_devh);
+        }
 #endif
         pthread_join(ctx->handler_thread, NULL);
     }
     else {
 #ifndef __ANDROID__
-        libusb_close(devh->usb_devh);
+        if(devh->owns_usb_devh) {
+            libusb_close(devh->usb_devh);
+        }
 #endif
     }
 
